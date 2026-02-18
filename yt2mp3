@@ -1,0 +1,384 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import json
+import shutil
+import argparse
+import threading
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass, field
+from typing import Optional
+
+try:
+    import yt_dlp
+    from rich.console import Console
+    from rich.progress import (
+        Progress, SpinnerColumn, BarColumn, TextColumn,
+        DownloadColumn, TransferSpeedColumn, TimeRemainingColumn, TaskID
+    )
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.text import Text
+    from rich import box
+except ImportError:
+    print("Installing dependencies...")
+    os.system(f"{sys.executable} -m pip install yt-dlp rich --quiet")
+    import yt_dlp
+    from rich.console import Console
+    from rich.progress import (
+        Progress, SpinnerColumn, BarColumn, TextColumn,
+        DownloadColumn, TransferSpeedColumn, TimeRemainingColumn, TaskID
+    )
+    from rich.table import Table
+    from rich.panel import Panel
+    from rich.text import Text
+    from rich import box
+
+console = Console()
+
+QUALITY_PRESETS = {
+    "best":   {"abr": 320, "asr": 48000},
+    "high":   {"abr": 256, "asr": 44100},
+    "medium": {"abr": 192, "asr": 44100},
+    "low":    {"abr": 128, "asr": 44100},
+    "voice":  {"abr": 64,  "asr": 22050},
+}
+
+@dataclass
+class DownloadResult:
+    url: str
+    title: str = ""
+    status: str = "pending"
+    output_path: str = ""
+    error: str = ""
+    size_bytes: int = 0
+
+@dataclass
+class DownloadState:
+    results: list = field(default_factory=list)
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+def build_ydl_opts(
+    output_dir: Path,
+    quality: str,
+    bitrate: Optional[int],
+    embed_thumbnail: bool,
+    embed_metadata: bool,
+    filename_template: str,
+    progress_hooks: list,
+    cookies_file: Optional[str],
+    sponsorblock: bool,
+    normalize: bool,
+) -> dict:
+    preset = QUALITY_PRESETS.get(quality, QUALITY_PRESETS["high"])
+    final_bitrate = bitrate or preset["abr"]
+    sample_rate   = preset["asr"]
+
+    postprocessors = [
+        {
+            "key": "FFmpegExtractAudio",
+            "preferredcodec": "mp3",
+            "preferredquality": str(final_bitrate),
+        },
+        {"key": "FFmpegMetadata", "add_metadata": embed_metadata},
+    ]
+
+    if embed_thumbnail:
+        postprocessors.append({"key": "EmbedThumbnail"})
+
+    if normalize:
+        postprocessors.append({
+            "key": "FFmpegNormalize",
+            "preferredformat": "mp3",
+        })
+
+    if sponsorblock:
+        postprocessors.append({
+            "key": "SponsorBlock",
+            "categories": ["sponsor", "intro", "outro", "selfpromo", "interaction"],
+        })
+        postprocessors.append({
+            "key": "ModifyChapters",
+            "remove_sponsor_segments": ["sponsor", "intro", "outro", "selfpromo", "interaction"],
+        })
+
+    opts = {
+        "format": "bestaudio/best",
+        "outtmpl": str(output_dir / filename_template),
+        "writethumbnail": embed_thumbnail,
+        "postprocessors": postprocessors,
+        "postprocessor_args": {
+            "ffmpegextractaudio": [
+                "-ar", str(sample_rate),
+                "-q:a", "0",
+            ]
+        },
+        "progress_hooks": progress_hooks,
+        "quiet": True,
+        "no_warnings": True,
+        "ignoreerrors": False,
+        "retries": 5,
+        "fragment_retries": 5,
+        "concurrent_fragment_downloads": 4,
+        "geo_bypass": True,
+    }
+
+    if cookies_file:
+        opts["cookiefile"] = cookies_file
+
+    return opts
+
+
+class RichProgressHook:
+    def __init__(self, progress: Progress, task_id: TaskID, result: DownloadResult):
+        self.progress = progress
+        self.task_id  = task_id
+        self.result   = result
+
+    def __call__(self, d: dict):
+        status = d.get("status")
+        if status == "downloading":
+            total     = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            downloaded = d.get("downloaded_bytes", 0)
+            speed     = d.get("speed") or 0
+            if total:
+                self.progress.update(
+                    self.task_id,
+                    completed=downloaded,
+                    total=total,
+                    description=f"[cyan]{self.result.title[:40]}[/cyan]",
+                )
+        elif status == "finished":
+            self.result.output_path = d.get("filename", "")
+            self.result.size_bytes  = d.get("total_bytes", 0)
+            self.progress.update(self.task_id, completed=self.progress.tasks[self.task_id].total or 100)
+
+
+def resolve_urls(raw_urls: list[str], flat_playlist: bool) -> list[str]:
+    resolved = []
+    ydl_opts = {"quiet": True, "no_warnings": True, "extract_flat": True}
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        for url in raw_urls:
+            try:
+                info = ydl.extract_info(url, download=False)
+                if info is None:
+                    continue
+                if info.get("_type") == "playlist":
+                    entries = info.get("entries", [])
+                    console.print(f"[green]Playlist detected:[/green] [bold]{info.get('title','?')}[/bold] — {len(entries)} tracks")
+                    if flat_playlist:
+                        resolved.extend(e["url"] if e.get("url", "").startswith("http") else f"https://www.youtube.com/watch?v={e['id']}" for e in entries if e)
+                    else:
+                        resolved.append(url)
+                else:
+                    resolved.append(url)
+            except Exception as e:
+                console.print(f"[red]Could not resolve:[/red] {url} — {e}")
+    return resolved
+
+
+def download_single(
+    url: str,
+    output_dir: Path,
+    quality: str,
+    bitrate: Optional[int],
+    embed_thumbnail: bool,
+    embed_metadata: bool,
+    filename_template: str,
+    progress: Progress,
+    state: DownloadState,
+    cookies_file: Optional[str],
+    sponsorblock: bool,
+    normalize: bool,
+) -> DownloadResult:
+    result = DownloadResult(url=url)
+
+    with yt_dlp.YoutubeDL({"quiet": True, "no_warnings": True}) as probe:
+        try:
+            info = probe.extract_info(url, download=False)
+            result.title = info.get("title", url)[:60]
+        except Exception:
+            result.title = url
+
+    task_id = progress.add_task(f"[dim]{result.title[:40]}[/dim]", total=None)
+    hook    = RichProgressHook(progress, task_id, result)
+
+    opts = build_ydl_opts(
+        output_dir=output_dir,
+        quality=quality,
+        bitrate=bitrate,
+        embed_thumbnail=embed_thumbnail,
+        embed_metadata=embed_metadata,
+        filename_template=filename_template,
+        progress_hooks=[hook],
+        cookies_file=cookies_file,
+        sponsorblock=sponsorblock,
+        normalize=normalize,
+    )
+
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.download([url])
+        result.status = "success"
+        progress.update(task_id, description=f"[green]✓[/green] {result.title[:45]}")
+    except Exception as e:
+        result.status = "failed"
+        result.error  = str(e)
+        progress.update(task_id, description=f"[red]✗[/red] {result.title[:45]}")
+
+    with state.lock:
+        state.results.append(result)
+
+    return result
+
+
+def print_summary(results: list[DownloadResult]):
+    table = Table(
+        title="Download Summary",
+        box=box.ROUNDED,
+        show_lines=True,
+        header_style="bold magenta",
+    )
+    table.add_column("#",          style="dim",    width=4)
+    table.add_column("Title",      style="white",  max_width=45)
+    table.add_column("Status",     justify="center")
+    table.add_column("Size",       justify="right", style="cyan")
+    table.add_column("Error",      style="red",    max_width=35)
+
+    for i, r in enumerate(results, 1):
+        status_str = "[green]✓ OK[/green]" if r.status == "success" else "[red]✗ FAIL[/red]"
+        size_str   = f"{r.size_bytes / 1_048_576:.1f} MB" if r.size_bytes else "—"
+        table.add_row(str(i), r.title or r.url, status_str, size_str, r.error or "")
+
+    console.print()
+    console.print(table)
+
+    ok    = sum(1 for r in results if r.status == "success")
+    fail  = len(results) - ok
+    console.print(
+        Panel(
+            f"[green]Succeeded:[/green] {ok}   [red]Failed:[/red] {fail}   [cyan]Total:[/cyan] {len(results)}",
+            title="Result", expand=False
+        )
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="yt2mp3",
+        description="Advanced YouTube → MP3 downloader",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  yt2mp3 https://youtu.be/xyz
+  yt2mp3 https://youtu.be/xyz -q best --thumbnail --metadata
+  yt2mp3 https://youtube.com/playlist?list=PL... --workers 4
+  yt2mp3 urls.txt -o ~/Music -q high --bitrate 320 --sponsorblock
+        """,
+    )
+
+    parser.add_argument("urls", nargs="+", help="YouTube URL(s) or a .txt file with one URL per line")
+    parser.add_argument("-o", "--output",      default="./downloads",   help="Output directory (default: ./downloads)")
+    parser.add_argument("-q", "--quality",     default="high",          choices=list(QUALITY_PRESETS), help="Quality preset")
+    parser.add_argument("--bitrate",           type=int,                help="Override bitrate in kbps (e.g. 320)")
+    parser.add_argument("--thumbnail",         action="store_true",     help="Embed album art thumbnail")
+    parser.add_argument("--metadata",          action="store_true",     default=True, help="Embed ID3 metadata (default: on)")
+    parser.add_argument("--no-metadata",       dest="metadata",         action="store_false")
+    parser.add_argument("--sponsorblock",      action="store_true",     help="Remove sponsor segments via SponsorBlock")
+    parser.add_argument("--normalize",         action="store_true",     help="Normalize audio loudness")
+    parser.add_argument("--workers",           type=int,   default=3,   help="Concurrent downloads (default: 3)")
+    parser.add_argument("--filename",          default="%(uploader)s - %(title)s.%(ext)s", help="Output filename template")
+    parser.add_argument("--cookies",           default=None,            help="Path to cookies.txt for age-restricted content")
+    parser.add_argument("--flat-playlist",     action="store_true",     default=True, help="Download playlist tracks individually")
+    parser.add_argument("--info",              action="store_true",     help="Print track info only, do not download")
+
+    args = parser.parse_args()
+
+    raw_urls: list[str] = []
+    for token in args.urls:
+        p = Path(token)
+        if p.is_file() and p.suffix == ".txt":
+            raw_urls.extend(line.strip() for line in p.read_text().splitlines() if line.strip())
+        else:
+            raw_urls.append(token)
+
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        console.print("[bold red]ffmpeg not found.[/bold red] Install it: [cyan]brew install ffmpeg[/cyan] / [cyan]sudo apt install ffmpeg[/cyan]")
+        sys.exit(1)
+
+    console.print(Panel(
+        f"[bold cyan]yt2mp3[/bold cyan]  Quality: [yellow]{args.quality}[/yellow]"
+        + (f" @ [yellow]{args.bitrate}kbps[/yellow]" if args.bitrate else "")
+        + f"  Workers: [yellow]{args.workers}[/yellow]"
+        + f"  Output: [yellow]{output_dir.resolve()}[/yellow]",
+        expand=False,
+    ))
+
+    urls = resolve_urls(raw_urls, flat_playlist=args.flat_playlist)
+    if not urls:
+        console.print("[red]No valid URLs found.[/red]")
+        sys.exit(1)
+
+    if args.info:
+        with yt_dlp.YoutubeDL({"quiet": True}) as ydl:
+            for url in urls:
+                info = ydl.extract_info(url, download=False)
+                console.print_json(json.dumps({
+                    "title":    info.get("title"),
+                    "uploader": info.get("uploader"),
+                    "duration": info.get("duration"),
+                    "view_count": info.get("view_count"),
+                    "formats": [f["format_id"] for f in info.get("formats", [])],
+                }, indent=2))
+        return
+
+    state = DownloadState()
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(bar_width=30),
+        DownloadColumn(),
+        TransferSpeedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+        expand=True,
+    ) as progress:
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futures = {
+                pool.submit(
+                    download_single,
+                    url=url,
+                    output_dir=output_dir,
+                    quality=args.quality,
+                    bitrate=args.bitrate,
+                    embed_thumbnail=args.thumbnail,
+                    embed_metadata=args.metadata,
+                    filename_template=args.filename,
+                    progress=progress,
+                    state=state,
+                    cookies_file=args.cookies,
+                    sponsorblock=args.sponsorblock,
+                    normalize=args.normalize,
+                ): url
+                for url in urls
+            }
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as exc:
+                    url = futures[future]
+                    with state.lock:
+                        state.results.append(DownloadResult(url=url, status="failed", error=str(exc)))
+
+    print_summary(state.results)
+
+
+if __name__ == "__main__":
+    main()
