@@ -256,6 +256,4 @@ This tool is intended for downloading content you have the right to download (e.
 
 ---
 
-## License
 
-MIT — see [LICENSE](LICENSE) for details.
